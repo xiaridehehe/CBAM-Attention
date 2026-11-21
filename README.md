@@ -1,5 +1,14 @@
 # MRNet ResNet18-CBAM 论文复现
 
+## SIP 原型与视角注意力（MRNet）
+
+```powershell
+python train.py --mode sip --prototype-samples 10 --prototype-lambda 0.01
+python train.py --evaluate runs/resnet_cbam_sip/best.pt
+```
+
+默认 `--mode baseline`。SIP 模式用 one-hot 初始化可学习标签输入，分别编码高斯均值和正方差，训练时按 SIP 式 (9) 将多次重参数化采样取平均。评估使用高斯期望以获得确定性结果。三个视角各自的 512 维特征作为注意力的 Key 和 Value，三个原型作为 Query，各标签经自己的线性头输出 logit。原型聚合使用视角特征的均值，与正标签原型的均值计算平方 L2 距离。SIP 日志分别记录总损失、BCE 和原型聚合损失，默认输出到 `runs/resnet_cbam_sip`。
+
 在项目目录安装依赖并启动训练。请使用与本机 GPU 匹配的 PyTorch 环境。默认初始化会通过 torchvision 加载 ImageNet 权重。
 
 ```powershell
@@ -17,6 +26,12 @@ python train.py --evaluate runs/resnet_cbam/best.pt
 ```powershell
 python train.py --no-cbam --output runs/resnet
 python train.py --dropout 0.5 --output runs/resnet_cbam_dropout
+```
+
+Dropout 对照沿用已有的 `runs/resnet_cbam/metrics.jsonl` 基线。自己运行上方的 dropout 命令后，用下方命令比较两组共同完成的轮次。脚本报告各组最高验证宏平均 ROC AUC、最低加权 BCE，以及最后一个共同轮次的两项指标。
+
+```powershell
+python compare_dropout.py
 ```
 
 论文报告的验证宏平均 AUC 为 0.925（CBAM）、0.916（无 CBAM）和 0.924（CBAM + dropout）。这些数值是论文的实验结果。

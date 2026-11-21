@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -10,19 +11,31 @@ from torch.utils.data import DataLoader
 from data.mrnet_multilabel import (
     DEFAULT_DATA_ROOT, LABEL_NAMES, MRNetDataset, read_records, split_records,
 )
-from model import ResNetCBAM
+from model import ResNetCBAM, SIPResNetCBAM, prototype_aggregation_loss
 
 
-def run_epoch(model, loader, loss_fn, device, optimizer=None):
+def run_epoch(model, loader, loss_fn, device, optimizer=None, prototype_lambda=0.01):
     training = optimizer is not None
     model.train(training)
     losses, labels, scores = [], [], []
+    sip = isinstance(model, SIPResNetCBAM)
+    bce_total = pa_total = 0.0
     with torch.set_grad_enabled(training):
         for views, target, _ in loader:
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            logits = model([view[0].to(device) for view in views])
-            loss = loss_fn(logits, target.to(device))
+            views = [view[0].to(device) for view in views]
+            device_target = target.to(device)
+            if sip:
+                logits, prototypes, global_features, _ = model(views, return_aux=True)
+                bce = loss_fn(logits, device_target)
+                pa = prototype_aggregation_loss(device_target, prototypes, global_features)
+                loss = bce + prototype_lambda * pa
+                bce_total += bce.item()
+                pa_total += pa.item()
+            else:
+                logits = model(views)
+                loss = loss_fn(logits, device_target)
             if training:
                 loss.backward()
                 optimizer.step()
@@ -36,7 +49,10 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None):
         for i, name in enumerate(LABEL_NAMES)
     }
     macro = sum(auc.values()) / len(auc) if None not in auc.values() else None
-    return {"loss": sum(losses) / len(losses), "auc": auc, "macro_auc": macro}
+    metrics = {"loss": sum(losses) / len(losses), "auc": auc, "macro_auc": macro}
+    if sip:
+        metrics.update(bce_loss=bce_total / len(losses), pa_loss=pa_total / len(losses))
+    return metrics
 
 
 def main():
@@ -54,11 +70,16 @@ def main():
     parser.add_argument("--dropout", type=float, default=0)
     parser.add_argument("--no-cbam", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
-    parser.add_argument("--output", type=Path, default=Path("runs/resnet_cbam"))
+    parser.add_argument("--mode", choices=("baseline", "sip"), default="baseline")
+    parser.add_argument("--prototype-samples", type=int, default=10)
+    parser.add_argument("--prototype-lambda", type=float, default=0.01)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--evaluate", type=Path, help="Evaluate a saved checkpoint on the validation split")
     args = parser.parse_args()
     if args.epochs < 1 or args.size < 1 or args.workers < 0:
         parser.error("epochs and size must be positive and workers must be nonnegative")
+    if args.prototype_samples < 1 or not math.isfinite(args.prototype_lambda) or args.prototype_lambda < 0:
+        parser.error("prototype-samples must be positive and prototype-lambda must be finite and nonnegative")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -68,9 +89,14 @@ def main():
     config = checkpoint["model_config"] if checkpoint else {
         "cbam": not args.no_cbam, "dropout": args.dropout,
     }
+    mode = checkpoint.get("mode", "baseline") if checkpoint else args.mode
+    prototype_lambda = checkpoint.get("prototype_lambda", 0.01) if checkpoint else args.prototype_lambda
+    if mode == "sip" and checkpoint is None:
+        config["prototype_samples"] = args.prototype_samples
     size = checkpoint["size"] if checkpoint else args.size
     val_loader = DataLoader(MRNetDataset(val, args.data_root, size), batch_size=1, num_workers=args.workers)
-    model = ResNetCBAM(pretrained=checkpoint is None and not args.no_pretrained, **config).to(device)
+    model_cls = SIPResNetCBAM if mode == "sip" else ResNetCBAM
+    model = model_cls(pretrained=checkpoint is None and not args.no_pretrained, **config).to(device)
     targets = torch.tensor([row["target"] for row in train])
     positive = targets.sum(dim=0)
     negative = len(train) - positive
@@ -83,7 +109,7 @@ def main():
     )
     if checkpoint:
         model.load_state_dict(checkpoint["model"])
-        print(json.dumps(run_epoch(model, val_loader, loss_fn, device)))
+        print(json.dumps(run_epoch(model, val_loader, loss_fn, device, prototype_lambda=prototype_lambda)))
         return
 
     train_loader = DataLoader(
@@ -93,15 +119,16 @@ def main():
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    args.output.mkdir(parents=True, exist_ok=True)
+    output = args.output or Path("runs/resnet_cbam_sip" if mode == "sip" else "runs/resnet_cbam")
+    output.mkdir(parents=True, exist_ok=True)
     best = float("-inf")
-    with (args.output / "metrics.jsonl").open("w", encoding="utf-8") as log:
+    with (output / "metrics.jsonl").open("w", encoding="utf-8") as log:
         for epoch in range(1, args.epochs + 1):
             metrics = {
                 "epoch": epoch,
                 "lr": optimizer.param_groups[0]["lr"],
-                "train": run_epoch(model, train_loader, loss_fn, device, optimizer),
-                "val": run_epoch(model, val_loader, loss_fn, device),
+                "train": run_epoch(model, train_loader, loss_fn, device, optimizer, prototype_lambda),
+                "val": run_epoch(model, val_loader, loss_fn, device, prototype_lambda=prototype_lambda),
             }
             scheduler.step()
             line = json.dumps(metrics)
@@ -109,11 +136,13 @@ def main():
             log.write(line + "\n")
             log.flush()
             state = {"model": model.state_dict(), "model_config": config, "size": size, "epoch": epoch}
-            torch.save(state, args.output / "last.pt")
+            if mode == "sip":
+                state.update(mode=mode, prototype_lambda=prototype_lambda)
+            torch.save(state, output / "last.pt")
             auc = metrics["val"]["macro_auc"]
             if auc is not None and auc > best:
                 best = auc
-                torch.save(state, args.output / "best.pt")
+                torch.save(state, output / "best.pt")
 
 
 if __name__ == "__main__":

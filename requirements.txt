@@ -1,0 +1,5 @@
+numpy
+openpyxl
+scikit-learn
+torch
+torchvision

@@ -50,11 +50,11 @@ class ResNetCBAM(nn.Module):
 
 
 class SIPResNetCBAM(ResNetCBAM):
-    def __init__(self, pretrained=True, cbam=True, dropout=0.0, prototype_samples=10):
+    def __init__(self, pretrained=True, cbam=True, dropout=0.0, prototype_samples=10, num_labels=3):
         super().__init__(pretrained=pretrained, cbam=cbam, dropout=dropout)
         if prototype_samples < 1:
             raise ValueError("prototype_samples must be positive")
-        labels = self.classifier.out_features
+        labels = num_labels
         dim = self.backbone.layer4[-1].bn2.num_features
         self.prototype_samples = prototype_samples
         # SIP optimizes the label inputs, initialized to one-hot rows.

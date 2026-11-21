@@ -74,7 +74,9 @@ def main():
     parser.add_argument("--prototype-samples", type=int, default=10)
     parser.add_argument("--prototype-lambda", type=float, default=0.01)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--evaluate", type=Path, help="Evaluate a saved checkpoint on the validation split")
+    checkpoint_args = parser.add_mutually_exclusive_group()
+    checkpoint_args.add_argument("--evaluate", type=Path, help="Evaluate a saved checkpoint on the validation split")
+    checkpoint_args.add_argument("--resume", type=Path, help="Continue training from a checkpoint into a new output directory")
     args = parser.parse_args()
     if args.epochs < 1 or args.size < 1 or args.workers < 0:
         parser.error("epochs and size must be positive and workers must be nonnegative")
@@ -85,7 +87,8 @@ def main():
     device = torch.device(args.device)
     metadata = args.metadata or args.data_root / "MRNet_Multilabel_Metadata.xlsx"
     train, val = split_records(read_records(metadata))
-    checkpoint = torch.load(args.evaluate, map_location="cpu", weights_only=True) if args.evaluate else None
+    checkpoint_path = args.evaluate or args.resume
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True) if checkpoint_path else None
     config = checkpoint["model_config"] if checkpoint else {
         "cbam": not args.no_cbam, "dropout": args.dropout,
     }
@@ -109,6 +112,7 @@ def main():
     )
     if checkpoint:
         model.load_state_dict(checkpoint["model"])
+    if args.evaluate:
         print(json.dumps(run_epoch(model, val_loader, loss_fn, device, prototype_lambda=prototype_lambda)))
         return
 
@@ -118,12 +122,30 @@ def main():
         batch_size=1, shuffle=True, num_workers=args.workers,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    output = args.output or Path("runs/resnet_cbam_sip" if mode == "sip" else "runs/resnet_cbam")
+    completed = checkpoint["epoch"] if args.resume else 0
+    if completed >= args.epochs:
+        parser.error("--epochs is the total target epoch and must exceed the saved epoch")
+    legacy = args.resume and "optimizer" not in checkpoint
+    if legacy:
+        print("Legacy checkpoint: restoring weights and cosine position with fresh Adam state.", flush=True)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = args.lr
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, last_epoch=completed - 1 if legacy else -1,
+    )
+    if args.resume and not legacy:
+        if checkpoint["scheduler"]["T_max"] != args.epochs:
+            parser.error("--epochs must match the saved cosine schedule")
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    default_output = Path("runs/resnet_cbam_sip" if mode == "sip" else "runs/resnet_cbam")
+    output = args.output or (default_output.with_name(default_output.name + "_resume") if args.resume else default_output)
+    if args.resume and any((output / name).exists() for name in ("metrics.jsonl", "last.pt", "best.pt")):
+        parser.error("Choose a new --output directory to preserve previous logs and checkpoints")
     output.mkdir(parents=True, exist_ok=True)
     best = float("-inf")
     with (output / "metrics.jsonl").open("w", encoding="utf-8") as log:
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(completed + 1, args.epochs + 1):
             metrics = {
                 "epoch": epoch,
                 "lr": optimizer.param_groups[0]["lr"],
@@ -136,6 +158,7 @@ def main():
             log.write(line + "\n")
             log.flush()
             state = {"model": model.state_dict(), "model_config": config, "size": size, "epoch": epoch}
+            state.update(optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict())
             if mode == "sip":
                 state.update(mode=mode, prototype_lambda=prototype_lambda)
             torch.save(state, output / "last.pt")

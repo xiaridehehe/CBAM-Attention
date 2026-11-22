@@ -9,6 +9,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from data.kamrnet_dicom import DEFAULT_DATA_ROOT, LABEL_CODES, LABEL_NAMES, KAMRNetDicomDataset, read_splits
+from data.packed_views import collate_packed_views
 from model import ResNetCBAM, SIPResNetCBAM, prototype_aggregation_loss
 
 DEFAULT_PROTOTYPE_LAMBDA = 0.0001
@@ -23,29 +24,35 @@ class KAMRNetResNetCBAM(ResNetCBAM):
 def run_epoch(model, loader, loss_fn, device, optimizer=None, prototype_lambda=DEFAULT_PROTOTYPE_LAMBDA):
     training = optimizer is not None
     model.train(training)
-    losses, labels, scores = [], [], []
+    labels, scores = [], []
+    loss_total = 0.0
+    exam_count = 0
     sip = isinstance(model, SIPResNetCBAM)
     bce_total = pa_total = 0.0
     with torch.set_grad_enabled(training):
-        for views, target, _ in loader:
+        for slices, slice_counts, target, _ in loader:
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            views = [view[0].to(device) for view in views]
+            slices = slices.to(device)
             device_target = target.to(device)
+            batch_count = target.shape[0]
             if sip:
-                logits, prototypes, global_features, _ = model(views, return_aux=True)
+                logits, prototypes, global_features, _ = model(slices, slice_counts, return_aux=True)
                 bce = loss_fn(logits, device_target)
                 pa = prototype_aggregation_loss(device_target, prototypes, global_features)
                 loss = bce + prototype_lambda * pa
-                bce_total += bce.item()
-                pa_total += pa.item()
+                bce_total += bce.item() * batch_count
+                positive_exams = (target == 1).any(dim=1).sum().item()
+                pa_total += pa.item() * positive_exams
             else:
-                logits = model(views)
+                logits = model(slices, slice_counts)
                 loss = loss_fn(logits, device_target)
             if training:
                 loss.backward()
                 optimizer.step()
-            losses.append(loss.item())
+            if not sip:
+                loss_total += loss.item() * batch_count
+            exam_count += batch_count
             labels.append(target)
             scores.append(logits.detach().float().sigmoid().cpu())
     y = torch.cat(labels).numpy()
@@ -56,9 +63,11 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None, prototype_lambda=D
     }
     valid_auc = [value for value in auc.values() if value is not None]
     macro = sum(valid_auc) / len(valid_auc) if valid_auc else None
-    metrics = {"loss": sum(losses) / len(losses), "auc": auc, "macro_auc": macro}
+    metrics = {"loss": loss_total / exam_count, "auc": auc, "macro_auc": macro}
     if sip:
-        metrics.update(bce_loss=bce_total / len(losses), pa_loss=pa_total / len(losses))
+        # Report per-exam averages, with zero PA contribution for negative-only exams.
+        metrics.update(bce_loss=bce_total / exam_count, pa_loss=pa_total / exam_count)
+        metrics["loss"] = metrics["bce_loss"] + prototype_lambda * metrics["pa_loss"]
     return metrics
 
 
@@ -67,6 +76,7 @@ def main():
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--metadata", type=Path, help="Defaults to the workbook inside data-root")
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=1, help="Number of exams per batch")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--size", type=int, default=256)
@@ -85,8 +95,8 @@ def main():
     checkpoint_args.add_argument("--evaluate", type=Path, help="Evaluate a saved checkpoint on the validation split")
     checkpoint_args.add_argument("--resume", type=Path, help="Continue from a saved checkpoint into a new output directory")
     args = parser.parse_args()
-    if args.epochs < 1 or args.size < 1 or args.workers < 0:
-        parser.error("epochs and size must be positive and workers must be nonnegative")
+    if args.epochs < 1 or args.size < 1 or args.batch_size < 1 or args.workers < 0:
+        parser.error("epochs, size and batch-size must be positive and workers must be nonnegative")
     if args.prototype_samples < 1 or not math.isfinite(args.prototype_lambda) or args.prototype_lambda < 0:
         parser.error("prototype-samples must be positive and prototype-lambda must be finite and nonnegative")
 
@@ -112,7 +122,10 @@ def main():
         model_cls = SIPResNetCBAM
         config["num_labels"] = len(LABEL_CODES)
     size = checkpoint["size"] if checkpoint else args.size
-    val_loader = DataLoader(KAMRNetDicomDataset(val, args.data_root, size), batch_size=1, num_workers=args.workers)
+    val_loader = DataLoader(
+        KAMRNetDicomDataset(val, args.data_root, size), batch_size=args.batch_size,
+        num_workers=args.workers, collate_fn=collate_packed_views,
+    )
     model = model_cls(pretrained=checkpoint is None and not args.no_pretrained, **config).to(device)
     targets = torch.tensor([row["target"] for row in train])
     positive = targets.sum(dim=0)
@@ -132,8 +145,8 @@ def main():
 
     train_loader = DataLoader(
         KAMRNetDicomDataset(train, args.data_root, size, True, args.degrees, args.translate),
-        # Native slice counts vary by patient and the model fuses one patient at a time.
-        batch_size=1, shuffle=True, num_workers=args.workers,
+        batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
+        collate_fn=collate_packed_views,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     completed = checkpoint["epoch"] if args.resume else 0

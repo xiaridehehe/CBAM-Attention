@@ -1,5 +1,16 @@
 # MRNet ResNet18-CBAM 论文复现
 
+## 可变切片数批处理
+
+MRNet 和 KAMRNet DICOM 的训练入口都支持 `--batch-size`，默认是 1。批次内的切片一起通过共享主干，再按检查和视角边界分别池化。Baseline 和 SIP 都支持该参数，评估和续训也可指定批大小。
+
+```powershell
+python train.py --mode sip --batch-size 2 --output runs/resnet_cbam_sip_b2
+python train_kamrnet_dicom.py --mode sip --batch-size 2 --output runs/kamrnet_dicom_sip_b2
+```
+
+显存占用随每批总切片数变化。增大批大小也会改变训练时的 BatchNorm 统计和每轮优化器更新次数。
+
 ## SIP 原型与视角注意力（MRNet）
 
 ```powershell

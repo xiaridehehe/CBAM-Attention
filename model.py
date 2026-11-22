@@ -38,15 +38,25 @@ class ResNetCBAM(nn.Module):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None])
 
     def encode_views(self, views):
-        # Each input is [slices, 3, height, width] for the same patient.
+        if len(views) != 3 or any(
+            view.ndim != 4 or view.shape[0] == 0 or view.shape[1] != 3 for view in views
+        ):
+            raise ValueError("Expected three nonempty views with shape [slices, 3, H, W]")
         lengths = [view.shape[0] for view in views]
-        slices = torch.cat(views, dim=0)
-        features = self.backbone((slices - self.mean) / self.std)
-        return torch.stack([part.max(dim=0).values for part in features.split(lengths)])
+        return self.encode_packed_views(torch.cat(views, dim=0), lengths)[0]
 
-    def forward(self, views):
-        pooled = self.encode_views(views).flatten()
-        return self.classifier(self.dropout(pooled))[None]
+    def encode_packed_views(self, slices, lengths):
+        if slices.ndim != 4 or slices.shape[1] != 3:
+            raise ValueError("Expected packed slices with shape [total_slices, 3, H, W]")
+        if not lengths or len(lengths) % 3 or min(lengths) < 1 or sum(lengths) != slices.shape[0]:
+            raise ValueError("Slice counts must describe three nonempty views per exam")
+        features = self.backbone((slices - self.mean) / self.std)
+        pooled = torch.stack([part.max(dim=0).values for part in features.split(lengths)])
+        return pooled.reshape(-1, 3, features.shape[-1])
+
+    def forward(self, views, slice_counts=None):
+        tokens = self.encode_views(views)[None] if slice_counts is None else self.encode_packed_views(views, slice_counts)
+        return self.classifier(self.dropout(tokens.flatten(start_dim=1)))
 
 
 class SIPResNetCBAM(ResNetCBAM):
@@ -72,12 +82,11 @@ class SIPResNetCBAM(ResNetCBAM):
         noise = torch.randn((self.prototype_samples, *mean.shape), device=mean.device, dtype=mean.dtype)
         return (mean + variance.sqrt() * noise).mean(dim=0)
 
-    def forward(self, views, *, return_aux=False):
-        if len(views) != 3 or any(view.ndim != 4 or view.shape[0] == 0 or view.shape[1] != 3 for view in views):
-            raise ValueError("Expected three nonempty views with shape [slices, 3, H, W]")
-        tokens = self.encode_views(views)[None]  # [1, views, 512]
+    def forward(self, views, slice_counts=None, *, return_aux=False):
+        tokens = self.encode_views(views)[None] if slice_counts is None else self.encode_packed_views(views, slice_counts)
         prototypes = self.disease_prototypes()  # [labels, 512]
-        fused, weights = self.view_attention(prototypes[None], tokens, tokens, need_weights=return_aux)
+        queries = prototypes[None].expand(tokens.shape[0], -1, -1)
+        fused, weights = self.view_attention(queries, tokens, tokens, need_weights=return_aux)
         # Each disease classifier uses only its corresponding fused feature.
         logits = (self.dropout(fused) * self.classifier.weight).sum(dim=-1) + self.classifier.bias
         if return_aux:

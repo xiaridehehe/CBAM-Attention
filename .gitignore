@@ -1,0 +1,14 @@
+/runs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.log
+metrics.jsonl
+events.out.tfevents.*
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
